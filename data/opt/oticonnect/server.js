@@ -12,6 +12,7 @@ const LINK_BASE = 'https://dom.oti.cat/api/ha/link';
 const POLL_BASE = 'https://dom.oti.cat/api/ha/link';
 
 const CREDENTIALS_URL = 'https://dom.oti.cat/api/ha/credentials';
+const REVOKE_URL = 'https://dom.oti.cat/api/ha/link/revoke';
 
 const MOSQUITTO_CONF = '/etc/mosquitto/mosquitto.conf';
 const MOSQUITTO_CONF_D = '/etc/mosquitto/conf.d';
@@ -110,6 +111,15 @@ function fetchCredentials() {
     .catch(function(e) {
       process.stdout.write('credentials fetch failed: ' + e.message + '\n');
     });
+}
+
+// Tell dom.oti.cat to revoke this device's link server-side so the long-lived JWT can no longer
+// fetch MQTT credentials. Best-effort: unlinking must succeed locally even if dom is unreachable.
+function revokeToken(cfg) {
+  if (!cfg || !cfg.token) return Promise.resolve();
+  return fetch(REVOKE_URL, { method: 'POST', headers: { 'Authorization': 'Bearer ' + cfg.token } })
+    .then(function(r) { process.stdout.write('token revoke: ' + r.status + '\n'); })
+    .catch(function(e) { process.stdout.write('token revoke failed: ' + e.message + '\n'); });
 }
 
 // --- Mosquitto bridge ---
@@ -879,6 +889,10 @@ ${STYLE}
   <div class="modal-overlay" id="deviceUnlinkModal">
     <div class="modal">
       <div class="modal-title">Unlink this device?</div>
+      <div class="warn-msg show">
+        <span class="warn-icon">&#9888;</span>
+        <span>If you opened this page remotely via <strong>Open SMHUB</strong>, that connection runs through this link &mdash; unlinking drops it immediately. You&rsquo;ll need to be on the SMHUB&rsquo;s local network to link it again.</span>
+      </div>
       <p class="m-body" style="margin-bottom:0.75rem">This will disconnect the SMHUB from <strong class="m-em">${esc(cfg.name)}</strong> and undo all applied integrations:</p>
       <ul class="m-list">
         <li>Zigbee2MQTT &mdash; revert MQTT config to localhost, disable HA discovery</li>
@@ -1400,11 +1414,15 @@ const server = http.createServer(function(req, res) {
   }
 
   if (url.pathname === '/unlink' && req.method === 'POST') {
+    var unlinkCfg = loadConfig();
     wsStop();
     removeVpn();
-    saveConfig({});
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('ok');
+    // Revoke the token server-side before we discard it locally (best-effort — never blocks unlink).
+    revokeToken(unlinkCfg).then(function() {
+      saveConfig({});
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('ok');
+    });
     return;
   }
 
