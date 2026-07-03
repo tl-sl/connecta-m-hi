@@ -113,26 +113,14 @@ function fetchCredentials() {
 }
 
 // --- Mosquitto bridge ---
+// Returns true if it changed anything (and restarted mosquitto), false if already correct.
+// Idempotent so reconcileIntegrations() can call it on every boot without bouncing the broker.
 function applyMosquitto(cfg) {
   var creds = cfg.credentials;
   if (!creds || !creds.mqtt_user || !creds.mqtt_password || !creds.mqtt_host) {
     throw new Error('credentials not available — wait for credential fetch to complete');
   }
   var clientId = 'tasmota-bridge-' + (cfg.deviceId || 'smhub').replace(/:/g, '');
-
-  try { fs.mkdirSync(MOSQUITTO_CONF_D, { recursive: true }); } catch {}
-
-  var mainConf = '';
-  try { mainConf = fs.readFileSync(MOSQUITTO_CONF, 'utf8'); } catch {}
-  if (!mainConf.includes('include_dir /etc/mosquitto/conf.d')) {
-    fs.appendFileSync(MOSQUITTO_CONF, '\ninclude_dir /etc/mosquitto/conf.d\n');
-  }
-
-  execSync(
-    'mosquitto_passwd -c -b ' + BRIDGE_PASSWD + ' ' + creds.mqtt_user + ' ' + creds.mqtt_password,
-    { timeout: 5000 }
-  );
-  execSync('chown mosquitto:mosquitto ' + BRIDGE_PASSWD + ' && chmod 640 ' + BRIDGE_PASSWD, { timeout: 3000 });
 
   var bridgeConf = [
     'listener 1883',
@@ -154,8 +142,28 @@ function applyMosquitto(cfg) {
     'topic tasmota/# both 0',
   ].join('\n') + '\n';
 
+  var mainConf = '';
+  try { mainConf = fs.readFileSync(MOSQUITTO_CONF, 'utf8'); } catch {}
+  var haveInclude = mainConf.includes('include_dir /etc/mosquitto/conf.d');
+  var curBridge = '';
+  try { curBridge = fs.readFileSync(BRIDGE_CONF, 'utf8'); } catch {}
+  var havePasswd = fs.existsSync(BRIDGE_PASSWD);
+  // Nothing drifted → no-op (the plaintext remote_password lives in bridgeConf, so a credential
+  // change shows up as a bridgeConf diff and still triggers a full re-apply below).
+  if (haveInclude && havePasswd && curBridge === bridgeConf) return false;
+
+  try { fs.mkdirSync(MOSQUITTO_CONF_D, { recursive: true }); } catch {}
+  if (!haveInclude) {
+    fs.appendFileSync(MOSQUITTO_CONF, '\ninclude_dir /etc/mosquitto/conf.d\n');
+  }
+  execSync(
+    'mosquitto_passwd -c -b ' + BRIDGE_PASSWD + ' ' + creds.mqtt_user + ' ' + creds.mqtt_password,
+    { timeout: 5000 }
+  );
+  execSync('chown mosquitto:mosquitto ' + BRIDGE_PASSWD + ' && chmod 640 ' + BRIDGE_PASSWD, { timeout: 3000 });
   fs.writeFileSync(BRIDGE_CONF, bridgeConf);
   execSync('rc-service mosquitto restart', { timeout: 10000 });
+  return true;
 }
 
 function removeMosquitto() {
@@ -209,10 +217,13 @@ function applyZigbee2mqtt(cfg) {
     '  ca: /etc/ssl/certs/ca-certificates.crt',
   ].join('\n');
   var haBlock = 'homeassistant:\n  enabled: true';
-  yaml = setYamlBlock(yaml, 'mqtt', mqttBlock);
-  yaml = setYamlBlock(yaml, 'homeassistant', haBlock);
-  fs.writeFileSync(Z2M_CONFIG, yaml);
+  var desired = setYamlBlock(setYamlBlock(yaml, 'mqtt', mqttBlock), 'homeassistant', haBlock);
+  // Idempotent: only rewrite + restart z2m if the mqtt/homeassistant blocks actually differ, so a
+  // reconcile on every boot doesn't drop the Zigbee network when nothing drifted.
+  if (desired === yaml) return false;
+  fs.writeFileSync(Z2M_CONFIG, desired);
   execSync('rc-service zigbee2mqtt restart', { timeout: 15000 });
+  return true;
 }
 
 function removeZigbee2mqtt() {
@@ -222,6 +233,31 @@ function removeZigbee2mqtt() {
   yaml = setYamlBlock(yaml, 'homeassistant', 'homeassistant:\n  enabled: false');
   fs.writeFileSync(Z2M_CONFIG, yaml);
   execSync('rc-service zigbee2mqtt restart', { timeout: 15000 });
+}
+
+// --- Self-healing reconcile ---
+// The SMHUB regenerates zigbee2mqtt/mosquitto config from its own `configsetting` source of truth
+// on OS upgrades, which silently reverts the blocks our integrations wrote (e.g. z2m's mqtt server
+// back to localhost, dropping our credentials) and leaves z2m unable to start. Since config.json
+// still says the integration is `applied`, we re-assert our config on every boot. apply* are
+// idempotent and only restart the affected service when something actually drifted, so this is a
+// no-op in the common case. Uses the stored credentials, so it works even if the live credential
+// fetch fails (expired token). NOTE: this only heals the config WE own (z2m mqtt/homeassistant
+// blocks, mosquitto bridge) — it does NOT touch z2m's serial.adapter, which the SMHUB also resets
+// to `zstack` on upgrade; on an EFR32 (ember) hub that still blocks z2m until fixed SMHUB-side.
+function reconcileIntegrations() {
+  var cfg = loadConfig();
+  var ints = cfg.integrations || {};
+  if (ints.mosquitto === 'applied') {
+    try {
+      if (applyMosquitto(cfg)) process.stdout.write('reconcile: re-applied mosquitto (drift healed)\n');
+    } catch (e) { process.stdout.write('reconcile mosquitto failed: ' + e.message + '\n'); }
+  }
+  if (ints.zigbee2mqtt === 'applied') {
+    try {
+      if (applyZigbee2mqtt(cfg)) process.stdout.write('reconcile: re-applied zigbee2mqtt (drift healed)\n');
+    } catch (e) { process.stdout.write('reconcile zigbee2mqtt failed: ' + e.message + '\n'); }
+  }
 }
 
 // --- LAN proxy + SOCKS5 tunnel ---
@@ -1449,8 +1485,10 @@ server.listen(PORT, '0.0.0.0', function() {
   process.stdout.write('oticonnect listening on :' + PORT + ' (device: ' + deviceId + ')\n');
   var cfg = loadConfig();
   wsConnect();
-  fetchCredentials();
   if (cfg.integrations && cfg.integrations.vpn === 'applied') applyVpn();
+  // Refresh credentials (best-effort), then re-assert applied integrations to heal any config
+  // drift from an SMHUB upgrade. fetchCredentials always resolves, so reconcile runs regardless.
+  fetchCredentials().then(reconcileIntegrations);
 });
 
 process.on('SIGTERM', function() {
