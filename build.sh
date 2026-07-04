@@ -25,6 +25,7 @@ mkdir -p "$OUTDIR"
 # Ensure scripts are executable before packaging
 chmod +x "$SCRIPT_DIR/control/postinst"
 chmod +x "$SCRIPT_DIR/control/prerm"
+chmod +x "$SCRIPT_DIR/control/postrm"
 chmod +x "$SCRIPT_DIR/data/etc/init.d/dom.oti.cat"
 
 echo "[build] control.tar.gz"

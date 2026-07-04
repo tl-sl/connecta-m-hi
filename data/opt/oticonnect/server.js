@@ -18,7 +18,11 @@ const MOSQUITTO_CONF = '/etc/mosquitto/mosquitto.conf';
 const MOSQUITTO_CONF_D = '/etc/mosquitto/conf.d';
 const BRIDGE_CONF = '/etc/mosquitto/conf.d/oti-bridge.conf';
 const BRIDGE_PASSWD = '/etc/mosquitto/conf.d/oti-passwd';
-const Z2M_CONFIG = '/opt/zigbee2mqtt/data/configuration.yaml';
+// SMHUB local backend API. z2m config is written through here (persisted in SMHUB's own DB
+// AND applied to configuration.yaml by its config provider) instead of editing the yaml
+// directly, so opening the z2m settings page in the SMHUB UI no longer clobbers our values.
+const SMHUB_API = 'http://localhost:8000/api/v1';
+let smhubCookie = null;
 
 const INTEGRATIONS = [
   { key: 'zigbee2mqtt', label: 'Zigbee2MQTT' },
@@ -124,7 +128,7 @@ function revokeToken(cfg) {
 
 // --- Mosquitto bridge ---
 // Returns true if it changed anything (and restarted mosquitto), false if already correct.
-// Idempotent so reconcileIntegrations() can call it on every boot without bouncing the broker.
+// Idempotent: a re-apply with unchanged credentials is a no-op and won't bounce the broker.
 function applyMosquitto(cfg) {
   var creds = cfg.credentials;
   if (!creds || !creds.mqtt_user || !creds.mqtt_password || !creds.mqtt_host) {
@@ -182,92 +186,92 @@ function removeMosquitto() {
   execSync('rc-service mosquitto restart', { timeout: 10000 });
 }
 
-// --- Zigbee2MQTT ---
-function setYamlBlock(yaml, key, block) {
-  var lines = yaml.split('\n');
-  var result = [];
-  var i = 0;
-  var found = false;
-  var re = new RegExp('^' + key + '(\\s*:.*)$');
-  while (i < lines.length) {
-    if (!found && re.test(lines[i])) {
-      found = true;
-      i++;
-      while (i < lines.length && /^[ \t]/.test(lines[i])) i++;
-      result.push(block);
-    } else {
-      result.push(lines[i]);
-      i++;
+// --- SMHUB backend API client ---
+// The packages settings endpoint requires an authenticated session (no localhost bypass), so we
+// log in with the SMHUB admin account. Credentials come from env (SMHUB_API_USER / SMHUB_API_PASS)
+// or, as a fallback, are read from SMLIGHT's own installed SPA bundle — the vendor default the SPA
+// itself auto-logs-in with — so no credential is stored in this repo.
+function getSmhubAuth() {
+  if (process.env.SMHUB_API_USER && process.env.SMHUB_API_PASS) {
+    return { user: process.env.SMHUB_API_USER, pass: process.env.SMHUB_API_PASS };
+  }
+  try {
+    var dir = '/opt/smhub-ui/assets';
+    var files = fs.readdirSync(dir).filter(function(f) { return /^index-.*\.js$/.test(f); });
+    for (var i = 0; i < files.length; i++) {
+      var js = fs.readFileSync(dir + '/' + files[i], 'utf8');
+      var m = js.match(/username:"([^"]+)",password:"([^"]+)"/);
+      if (m) return { user: m[1], pass: m[2] };
     }
-  }
-  if (!found) {
-    if (result.length && result[result.length - 1] !== '') result.push('');
-    result.push(block);
-  }
-  return result.join('\n');
+  } catch {}
+  throw new Error('SMHUB admin credentials unavailable — set SMHUB_API_USER / SMHUB_API_PASS');
 }
 
-function applyZigbee2mqtt(cfg) {
+async function smhubLogin() {
+  var auth = getSmhubAuth();
+  var fd = new FormData();  // multipart/form-data, matching the SMHUB SPA's own login call
+  fd.append('username', auth.user);
+  fd.append('password', auth.pass);
+  var r = await fetch(SMHUB_API + '/login/cookie', { method: 'POST', body: fd, redirect: 'manual' });
+  var cookies = typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : [];
+  if (!cookies.length) {
+    var sc = r.headers.get('set-cookie');
+    if (sc) cookies = [sc];
+  }
+  var jar = cookies.map(function(c) { return c.split(';')[0]; }).filter(Boolean).join('; ');
+  if (!jar) throw new Error('SMHUB login failed (status ' + r.status + ')');
+  smhubCookie = jar;
+}
+
+// POST a flat { field_key: value } map to a package's settings. SMHUB persists it in its DB and
+// applies it to the package's config source (for z2m, configuration.yaml) via the schema `path`s.
+async function smhubPostSettings(pkg, settings) {
+  async function send() {
+    return fetch(SMHUB_API + '/smhub/packages/' + pkg + '/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Cookie': smhubCookie || '' },
+      body: JSON.stringify(settings),
+    });
+  }
+  if (!smhubCookie) await smhubLogin();
+  var r = await send();
+  if (r.status === 401 || r.status === 403) { await smhubLogin(); r = await send(); }
+  if (!r.ok) {
+    var body = await r.text().catch(function() { return ''; });
+    throw new Error('SMHUB settings POST ' + pkg + ' failed: ' + r.status + ' ' + body.slice(0, 200));
+  }
+}
+
+// --- Zigbee2MQTT ---
+// Config is written through the SMHUB packages settings API (persisted in SMHUB's DB + applied to
+// configuration.yaml by its config provider), NOT by editing configuration.yaml directly — so the
+// values survive opening the z2m settings page in the SMHUB UI. Field keys match z2m's schema.json
+// `config` block: mqtt_broker_url→mqtt.server, base_topic→mqtt.base_topic, ha_enabled→homeassistant.enabled.
+async function applyZigbee2mqtt(cfg) {
   var creds = cfg.credentials;
   if (!creds || !creds.mqtt_user || !creds.mqtt_password || !creds.mqtt_host) {
     throw new Error('credentials not available — wait for credential fetch to complete');
   }
   var mac = (cfg.deviceId || '000000000000').replace(/:/g, '');
-  var clientId = 'z2m_' + mac;
-  var baseTopic = 'zigbee2mqtt_' + mac;
-  var yaml = '';
-  try { yaml = fs.readFileSync(Z2M_CONFIG, 'utf8'); } catch {}
-  var mqttBlock = [
-    'mqtt:',
-    '  base_topic: ' + baseTopic,
-    '  server: mqtts://' + creds.mqtt_host + ':8883',
-    '  user: ' + creds.mqtt_user,
-    '  password: ' + creds.mqtt_password,
-    '  client_id: ' + clientId,
-    '  ca: /etc/ssl/certs/ca-certificates.crt',
-  ].join('\n');
-  var haBlock = 'homeassistant:\n  enabled: true';
-  var desired = setYamlBlock(setYamlBlock(yaml, 'mqtt', mqttBlock), 'homeassistant', haBlock);
-  // Idempotent: only rewrite + restart z2m if the mqtt/homeassistant blocks actually differ, so a
-  // reconcile on every boot doesn't drop the Zigbee network when nothing drifted.
-  if (desired === yaml) return false;
-  fs.writeFileSync(Z2M_CONFIG, desired);
-  execSync('rc-service zigbee2mqtt restart', { timeout: 15000 });
-  return true;
-}
-
-function removeZigbee2mqtt() {
-  var yaml = '';
-  try { yaml = fs.readFileSync(Z2M_CONFIG, 'utf8'); } catch {}
-  yaml = setYamlBlock(yaml, 'mqtt', 'mqtt:\n  server: mqtt://localhost:1883');
-  yaml = setYamlBlock(yaml, 'homeassistant', 'homeassistant:\n  enabled: false');
-  fs.writeFileSync(Z2M_CONFIG, yaml);
+  await smhubPostSettings('zigbee2mqtt', {
+    mqtt_broker_url: 'mqtts://' + creds.mqtt_host + ':8883',
+    mqtt_user: creds.mqtt_user,
+    mqtt_password: creds.mqtt_password,
+    base_topic: 'zigbee2mqtt_' + mac,
+    ha_enabled: true,
+  });
   execSync('rc-service zigbee2mqtt restart', { timeout: 15000 });
 }
 
-// --- Self-healing reconcile ---
-// The SMHUB regenerates zigbee2mqtt/mosquitto config from its own `configsetting` source of truth
-// on OS upgrades, which silently reverts the blocks our integrations wrote (e.g. z2m's mqtt server
-// back to localhost, dropping our credentials) and leaves z2m unable to start. Since config.json
-// still says the integration is `applied`, we re-assert our config on every boot. apply* are
-// idempotent and only restart the affected service when something actually drifted, so this is a
-// no-op in the common case. Uses the stored credentials, so it works even if the live credential
-// fetch fails (expired token). NOTE: this only heals the config WE own (z2m mqtt/homeassistant
-// blocks, mosquitto bridge) — it does NOT touch z2m's serial.adapter, which the SMHUB also resets
-// to `zstack` on upgrade; on an EFR32 (ember) hub that still blocks z2m until fixed SMHUB-side.
-function reconcileIntegrations() {
-  var cfg = loadConfig();
-  var ints = cfg.integrations || {};
-  if (ints.mosquitto === 'applied') {
-    try {
-      if (applyMosquitto(cfg)) process.stdout.write('reconcile: re-applied mosquitto (drift healed)\n');
-    } catch (e) { process.stdout.write('reconcile mosquitto failed: ' + e.message + '\n'); }
-  }
-  if (ints.zigbee2mqtt === 'applied') {
-    try {
-      if (applyZigbee2mqtt(cfg)) process.stdout.write('reconcile: re-applied zigbee2mqtt (drift healed)\n');
-    } catch (e) { process.stdout.write('reconcile zigbee2mqtt failed: ' + e.message + '\n'); }
-  }
+async function removeZigbee2mqtt() {
+  await smhubPostSettings('zigbee2mqtt', {
+    mqtt_broker_url: 'mqtt://localhost:1883',
+    mqtt_user: '',
+    mqtt_password: '',
+    base_topic: 'zigbee2mqtt',
+    ha_enabled: false,
+  });
+  execSync('rc-service zigbee2mqtt restart', { timeout: 15000 });
 }
 
 // --- LAN proxy + SOCKS5 tunnel ---
@@ -841,7 +845,6 @@ function renderLinked(cfg) {
   var mqttPass = creds.mqtt_password || '';
   var tasmotaCmd = 'Backlog MqttHost ' + smhubIp + '; MqttPort 1883; MqttUser ' + mqttUser + '; MqttPassword ' + mqttPass + '; Restart 1';
   var mac = (cfg.deviceId || '000000000000').replace(/:/g, '');
-  var z2mClientId = 'z2m_' + mac;
   var z2mBaseTopic = 'zigbee2mqtt_' + mac;
   var localHaUrl = 'http://' + smhubIp + ':8123';
   return `<!DOCTYPE html>
@@ -925,13 +928,11 @@ ${STYLE}
   <div class="modal-overlay" id="z2mApplyModal">
     <div class="modal">
       <div class="modal-title">Enable Zigbee2MQTT?</div>
-      <p class="m-body">The following will be written to <code class="m-code">configuration.yaml</code> and Zigbee2MQTT will be restarted:</p>
+      <p class="m-body">The following Zigbee2MQTT settings will be saved via SMHUB (stored in its config and applied to <code class="m-code">configuration.yaml</code>) and Zigbee2MQTT will be restarted:</p>
       <table class="info-table" style="margin-bottom:1rem">
         <tr><td class="lbl">base_topic</td><td class="val">${esc(z2mBaseTopic)}</td></tr>
         <tr><td class="lbl">server</td><td class="val">mqtts://${esc(creds.mqtt_host || '')}:8883</td></tr>
         <tr><td class="lbl">user</td><td class="val">${esc(mqttUser)}</td></tr>
-        <tr><td class="lbl">client_id</td><td class="val">${esc(z2mClientId)}</td></tr>
-        <tr><td class="lbl">ca</td><td class="val">/etc/ssl/certs/ca-certificates.crt</td></tr>
       </table>
       <p class="m-note" style="margin-bottom:1.25rem">HA MQTT discovery will be enabled.</p>
       <div class="modal-actions">
@@ -1427,7 +1428,7 @@ const server = http.createServer(function(req, res) {
   }
 
   if (url.pathname === '/integration/apply' && req.method === 'POST') {
-    readBody(req).then(function(raw) {
+    readBody(req).then(async function(raw) {
       try {
         var data = JSON.parse(raw);
         var key = data.integration;
@@ -1435,7 +1436,7 @@ const server = http.createServer(function(req, res) {
         var cfg = loadConfig();
         ensureIntegrations(cfg);
         if (key === 'mosquitto') applyMosquitto(cfg);
-        else if (key === 'zigbee2mqtt') applyZigbee2mqtt(cfg);
+        else if (key === 'zigbee2mqtt') await applyZigbee2mqtt(cfg);
         else if (key === 'vpn') applyVpn();
         cfg.integrations[key] = 'applied';
         saveConfig(cfg);
@@ -1451,7 +1452,7 @@ const server = http.createServer(function(req, res) {
   }
 
   if (url.pathname === '/integration/remove' && req.method === 'POST') {
-    readBody(req).then(function(raw) {
+    readBody(req).then(async function(raw) {
       try {
         var data = JSON.parse(raw);
         var key = data.integration;
@@ -1459,7 +1460,7 @@ const server = http.createServer(function(req, res) {
         var cfg = loadConfig();
         ensureIntegrations(cfg);
         if (key === 'mosquitto') removeMosquitto();
-        else if (key === 'zigbee2mqtt') removeZigbee2mqtt();
+        else if (key === 'zigbee2mqtt') await removeZigbee2mqtt();
         else if (key === 'vpn') removeVpn();
         cfg.integrations[key] = 'pending';
         saveConfig(cfg);
@@ -1504,9 +1505,9 @@ server.listen(PORT, '0.0.0.0', function() {
   var cfg = loadConfig();
   wsConnect();
   if (cfg.integrations && cfg.integrations.vpn === 'applied') applyVpn();
-  // Refresh credentials (best-effort), then re-assert applied integrations to heal any config
-  // drift from an SMHUB upgrade. fetchCredentials always resolves, so reconcile runs regardless.
-  fetchCredentials().then(reconcileIntegrations);
+  // Refresh stored credentials (best-effort). z2m/mosquitto config now lives in SMHUB's own config
+  // store, so there's no drift to reconcile on boot — the SMHUB no longer clobbers our settings.
+  fetchCredentials();
 });
 
 process.on('SIGTERM', function() {

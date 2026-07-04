@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+LOGFILE=/var/log/oticonnect.log
+exec >> "$LOGFILE" 2>&1
+
+# On full removal only (opkg passes "remove"; on an upgrade it passes "upgrade", so the bridge
+# survives IPK updates), tear down the config we own: drop the service from the default runlevel
+# and remove the mosquitto bridge config so mosquitto returns to local-only mode.
+# (SMLIGHT asked for this cleanup on uninstall; we use postrm+remove rather than prerm because
+# prerm also runs on upgrades on this opkg, which would drop the bridge on every update.)
+if [ "$1" = "remove" ]; then
+    echo "[oticonnect] postrm remove: cleaning up owned config"
+    rc-update del dom.oti.cat default 2>/dev/null || true
+    if [ -f /etc/mosquitto/conf.d/oti-bridge.conf ] || [ -f /etc/mosquitto/conf.d/oti-passwd ]; then
+        rm -f /etc/mosquitto/conf.d/oti-bridge.conf /etc/mosquitto/conf.d/oti-passwd
+        rc-service mosquitto restart 2>/dev/null || true
+        echo "[oticonnect] postrm remove: removed mosquitto bridge config"
+    fi
+fi
+
+exit 0

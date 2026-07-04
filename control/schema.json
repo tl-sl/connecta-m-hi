@@ -1,0 +1,12 @@
+{
+    "system": {
+        "iframe_port": {
+            "default": 7890,
+            "type": "integer"
+        },
+        "service": {
+            "default": true,
+            "type": "boolean"
+        }
+    }
+}
