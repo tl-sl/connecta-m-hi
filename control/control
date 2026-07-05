@@ -1,5 +1,5 @@
 Package: dom.oti.cat
-Version: 1.9.0-1
+Version: 1.9.1-1
 Architecture: all
 Maintainer: oti.cat <hello@oti.cat>
 Description: Connect SMHUB Nano MG24 to oti.cat Home Assistant instances

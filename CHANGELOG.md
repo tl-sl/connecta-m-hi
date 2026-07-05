@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.9.1
+
+- **Zigbee2MQTT `client_id`**: the z2m config written on Apply now sets a unique
+  `client_id` (`z2m_<mac>`, path `mqtt.client_id`) via the SMHUB settings API. Without it,
+  two SMHUBs bridged to the same HA instance share z2m's default client id and the broker
+  kicks them off in a duplicate-client-id disconnect loop (`base_topic` separates topics but
+  not the connection). Cleared again on Remove. Requires `zigbee2mqtt ≥ 2.12.1` (the release
+  that added the `client_id` schema field).
+
 ## 1.9.0
 
 Config-system rework to align with the SMHUB packaging conventions (ahead of hosting on

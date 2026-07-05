@@ -246,7 +246,9 @@ async function smhubPostSettings(pkg, settings) {
 // Config is written through the SMHUB packages settings API (persisted in SMHUB's DB + applied to
 // configuration.yaml by its config provider), NOT by editing configuration.yaml directly — so the
 // values survive opening the z2m settings page in the SMHUB UI. Field keys match z2m's schema.json
-// `config` block: mqtt_broker_url→mqtt.server, base_topic→mqtt.base_topic, ha_enabled→homeassistant.enabled.
+// `config` block: mqtt_broker_url→mqtt.server, base_topic→mqtt.base_topic, client_id→mqtt.client_id,
+// ha_enabled→homeassistant.enabled. client_id (z2m_<mac>) is unique per SMHUB so two hubs bridged to the
+// same HA instance don't share z2m's default client id and get kicked off MQTT in a duplicate-id loop.
 async function applyZigbee2mqtt(cfg) {
   var creds = cfg.credentials;
   if (!creds || !creds.mqtt_user || !creds.mqtt_password || !creds.mqtt_host) {
@@ -258,6 +260,7 @@ async function applyZigbee2mqtt(cfg) {
     mqtt_user: creds.mqtt_user,
     mqtt_password: creds.mqtt_password,
     base_topic: 'zigbee2mqtt_' + mac,
+    client_id: 'z2m_' + mac,
     ha_enabled: true,
   });
   execSync('rc-service zigbee2mqtt restart', { timeout: 15000 });
@@ -269,6 +272,7 @@ async function removeZigbee2mqtt() {
     mqtt_user: '',
     mqtt_password: '',
     base_topic: 'zigbee2mqtt',
+    client_id: '',
     ha_enabled: false,
   });
   execSync('rc-service zigbee2mqtt restart', { timeout: 15000 });
@@ -931,6 +935,7 @@ ${STYLE}
       <p class="m-body">The following Zigbee2MQTT settings will be saved via SMHUB (stored in its config and applied to <code class="m-code">configuration.yaml</code>) and Zigbee2MQTT will be restarted:</p>
       <table class="info-table" style="margin-bottom:1rem">
         <tr><td class="lbl">base_topic</td><td class="val">${esc(z2mBaseTopic)}</td></tr>
+        <tr><td class="lbl">client_id</td><td class="val">z2m_${esc(mac)}</td></tr>
         <tr><td class="lbl">server</td><td class="val">mqtts://${esc(creds.mqtt_host || '')}:8883</td></tr>
         <tr><td class="lbl">user</td><td class="val">${esc(mqttUser)}</td></tr>
       </table>
