@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.9.2
+
+- **Mosquitto: defer to the SMHUB's native broker (Option B).** We no longer write our own
+  `listener 1883` + `password_file` into `conf.d` — that collided with the SMHUB's own
+  "Mosquitto MQTT Broker" page (duplicate `listener`/`password_file` → mosquitto refused to
+  start once a user configured MQTT in the UI). Now `applyMosquitto`:
+  - writes a **bridge-only** `conf.d/oti-bridge.conf` (just the `connection` to the HA instance),
+  - registers the HA MQTT user via the SMHUB API (`POST /users/create-mqtt-user` →
+    `/var/lib/mosquitto/passwd`),
+  - brings up the native listener via `POST /pages/mqtt/settings`
+    (`port 1883`, `allow_external`, `allow_anonymous: false`).
+  The SMHUB's listener is now the single owner of port 1883. `removeMosquitto` deletes only our
+  bridge file and leaves the SMHUB broker intact. The idempotent `include_dir` append is kept as
+  a safety net (mosquitto is a base-OS component here, not an opkg package).
+
 ## 1.9.1
 
 - **Zigbee2MQTT `client_id`**: the z2m config written on Apply now sets a unique

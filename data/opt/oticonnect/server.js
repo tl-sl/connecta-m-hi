@@ -129,7 +129,12 @@ function revokeToken(cfg) {
 // --- Mosquitto bridge ---
 // Returns true if it changed anything (and restarted mosquitto), false if already correct.
 // Idempotent: a re-apply with unchanged credentials is a no-op and won't bounce the broker.
-function applyMosquitto(cfg) {
+// Option B: we no longer own the listener. The SMHUB's native mosquitto listener (configured via
+// its "Mosquitto MQTT Broker" page → mosquitto.conf) is the single owner of port 1883, and Tasmota
+// devices authenticate against the SMHUB's own password file. We contribute only the outbound bridge
+// to the HA instance, as a `connection`-only file in conf.d. This avoids the duplicate-listener /
+// duplicate-password_file collision that happens when the user also touches the SMHUB MQTT page.
+async function applyMosquitto(cfg) {
   var creds = cfg.credentials;
   if (!creds || !creds.mqtt_user || !creds.mqtt_password || !creds.mqtt_host) {
     throw new Error('credentials not available — wait for credential fetch to complete');
@@ -137,10 +142,9 @@ function applyMosquitto(cfg) {
   var clientId = 'tasmota-bridge-' + (cfg.deviceId || 'smhub').replace(/:/g, '');
 
   var bridgeConf = [
-    'listener 1883',
-    'allow_anonymous false',
-    'password_file ' + BRIDGE_PASSWD,
-    '',
+    '# Bridge only. The SMHUB\'s native listener (mosquitto.conf) owns port 1883 +',
+    '# password_file /var/lib/mosquitto/passwd. This file adds just the outbound',
+    '# bridge to the oti.cat HA instance.',
     'connection oti-ha',
     'address ' + creds.mqtt_host + ':8883',
     'bridge_cafile /etc/ssl/certs/ca-certificates.crt',
@@ -159,28 +163,30 @@ function applyMosquitto(cfg) {
   var mainConf = '';
   try { mainConf = fs.readFileSync(MOSQUITTO_CONF, 'utf8'); } catch {}
   var haveInclude = mainConf.includes('include_dir /etc/mosquitto/conf.d');
-  var curBridge = '';
-  try { curBridge = fs.readFileSync(BRIDGE_CONF, 'utf8'); } catch {}
-  var havePasswd = fs.existsSync(BRIDGE_PASSWD);
-  // Nothing drifted → no-op (the plaintext remote_password lives in bridgeConf, so a credential
-  // change shows up as a bridgeConf diff and still triggers a full re-apply below).
-  if (haveInclude && havePasswd && curBridge === bridgeConf) return false;
 
+  // Ensure include_dir. SMLIGHT plans to bake this into the base OS config; until then our
+  // idempotent append is the safety net (a no-op once they ship it). mosquitto isn't an opkg
+  // package here, so there's no package that could provide it on already-deployed units.
   try { fs.mkdirSync(MOSQUITTO_CONF_D, { recursive: true }); } catch {}
   if (!haveInclude) {
     fs.appendFileSync(MOSQUITTO_CONF, '\ninclude_dir /etc/mosquitto/conf.d\n');
   }
-  execSync(
-    'mosquitto_passwd -c -b ' + BRIDGE_PASSWD + ' ' + creds.mqtt_user + ' ' + creds.mqtt_password,
-    { timeout: 5000 }
-  );
-  execSync('chown mosquitto:mosquitto ' + BRIDGE_PASSWD + ' && chmod 640 ' + BRIDGE_PASSWD, { timeout: 3000 });
   fs.writeFileSync(BRIDGE_CONF, bridgeConf);
+
+  // Register our MQTT user in the SMHUB's password file and bring up its native listener on
+  // 1883/all-interfaces with auth (both via the SMHUB API so they persist in its config store).
+  await smhubCreateMqttUser(creds.mqtt_user, creds.mqtt_password);
+  await smhubSetMqttBroker({ port: '1883', allow_external: true, allow_anonymous: false });
+
+  // The broker page handler restarts mosquitto, but do it explicitly too so the bridge conf we
+  // just wrote is guaranteed loaded regardless of the handler's behavior.
   execSync('rc-service mosquitto restart', { timeout: 10000 });
   return true;
 }
 
-function removeMosquitto() {
+async function removeMosquitto() {
+  // Remove only our bridge; leave the SMHUB's native listener + password file intact (the user
+  // manages those via the MQTT page). oti-passwd is legacy (pre-Option-B) — unlink if present.
   try { fs.unlinkSync(BRIDGE_CONF); } catch {}
   try { fs.unlinkSync(BRIDGE_PASSWD); } catch {}
   execSync('rc-service mosquitto restart', { timeout: 10000 });
@@ -223,23 +229,41 @@ async function smhubLogin() {
   smhubCookie = jar;
 }
 
-// POST a flat { field_key: value } map to a package's settings. SMHUB persists it in its DB and
-// applies it to the package's config source (for z2m, configuration.yaml) via the schema `path`s.
-async function smhubPostSettings(pkg, settings) {
+// Generic authed JSON POST to the SMHUB backend, with login + one 401/403 retry.
+async function smhubPostJson(path, body) {
   async function send() {
-    return fetch(SMHUB_API + '/smhub/packages/' + pkg + '/settings', {
+    return fetch(SMHUB_API + path, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Cookie': smhubCookie || '' },
-      body: JSON.stringify(settings),
+      body: JSON.stringify(body),
     });
   }
   if (!smhubCookie) await smhubLogin();
   var r = await send();
   if (r.status === 401 || r.status === 403) { await smhubLogin(); r = await send(); }
   if (!r.ok) {
-    var body = await r.text().catch(function() { return ''; });
-    throw new Error('SMHUB settings POST ' + pkg + ' failed: ' + r.status + ' ' + body.slice(0, 200));
+    var t = await r.text().catch(function() { return ''; });
+    throw new Error('SMHUB POST ' + path + ' failed: ' + r.status + ' ' + t.slice(0, 200));
   }
+  return r;
+}
+
+// POST a flat { field_key: value } map to a package's settings. SMHUB persists it in its DB and
+// applies it to the package's config source (for z2m, configuration.yaml) via the schema `path`s.
+async function smhubPostSettings(pkg, settings) {
+  await smhubPostJson('/smhub/packages/' + pkg + '/settings', settings);
+}
+
+// Add/update an MQTT user in the SMHUB's own password file (/var/lib/mosquitto/passwd), the file
+// the SMHUB's native listener authenticates against. Runs `mosquitto_passwd -b` server-side.
+async function smhubCreateMqttUser(username, password) {
+  await smhubPostJson('/users/create-mqtt-user', { username: username, password: password });
+}
+
+// Configure the SMHUB's native mosquitto broker (the "Mosquitto MQTT Broker" page, key `mqtt`):
+// port, external bind, anonymous. SMHUB writes it into mosquitto.conf and restarts mosquitto.
+async function smhubSetMqttBroker(settings) {
+  await smhubPostJson('/pages/mqtt/settings', settings);
 }
 
 // --- Zigbee2MQTT ---
@@ -903,7 +927,7 @@ ${STYLE}
       <p class="m-body" style="margin-bottom:0.75rem">This will disconnect the SMHUB from <strong class="m-em">${esc(cfg.name)}</strong> and undo all applied integrations:</p>
       <ul class="m-list">
         <li>Zigbee2MQTT &mdash; revert MQTT config to localhost, disable HA discovery</li>
-        <li>Mosquitto bridge &mdash; remove listener and bridge config, restart Mosquitto</li>
+        <li>Mosquitto bridge &mdash; remove the bridge config (the SMHUB broker/listener is left intact), restart Mosquitto</li>
         <li>LAN proxy &mdash; stop the port forward on port 8123</li>
       </ul>
       <div class="modal-actions">
@@ -918,8 +942,8 @@ ${STYLE}
       <div class="modal-title">Enable Mosquitto bridge?</div>
       <p class="m-body">The following changes will be made to Mosquitto and it will be restarted:</p>
       <ul class="m-list">
-        <li>Open a listener on <strong class="m-em">port 1883</strong> on all interfaces (LAN accessible)</li>
-        <li>Require authentication using the HA instance MQTT credentials</li>
+        <li>Configure the SMHUB broker to listen on <strong class="m-em">port 1883</strong> on all interfaces (LAN accessible), with anonymous access off</li>
+        <li>Add an MQTT user for the HA instance credentials (<strong class="m-em">${esc(creds.mqtt_user || '')}</strong>) so devices can authenticate</li>
         <li>Bridge <code class="m-code">tele/#</code>, <code class="m-code">stat/#</code>, <code class="m-code">cmnd/#</code> and <code class="m-code">tasmota/#</code> topics to <strong class="m-em">${esc(creds.mqtt_host || '')}:8883</strong></li>
       </ul>
       <div class="modal-actions">
@@ -1440,7 +1464,7 @@ const server = http.createServer(function(req, res) {
         if (!INTEGRATIONS.find(function(i) { return i.key === key; })) throw new Error('unknown');
         var cfg = loadConfig();
         ensureIntegrations(cfg);
-        if (key === 'mosquitto') applyMosquitto(cfg);
+        if (key === 'mosquitto') await applyMosquitto(cfg);
         else if (key === 'zigbee2mqtt') await applyZigbee2mqtt(cfg);
         else if (key === 'vpn') applyVpn();
         cfg.integrations[key] = 'applied';
@@ -1464,7 +1488,7 @@ const server = http.createServer(function(req, res) {
         if (!INTEGRATIONS.find(function(i) { return i.key === key; })) throw new Error('unknown');
         var cfg = loadConfig();
         ensureIntegrations(cfg);
-        if (key === 'mosquitto') removeMosquitto();
+        if (key === 'mosquitto') await removeMosquitto();
         else if (key === 'zigbee2mqtt') await removeZigbee2mqtt();
         else if (key === 'vpn') removeVpn();
         cfg.integrations[key] = 'pending';
