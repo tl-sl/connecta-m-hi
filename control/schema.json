@@ -6,7 +6,12 @@
         },
         "service": {
             "default": true,
-            "type": "boolean"
+            "type": "boolean",
+            "name": "dom.oti.cat"
+        },
+        "icons": {
+            "icon": "assets/dt-icon.svg",
+            "app": "assets/dt-app.svg"
         }
     }
 }
