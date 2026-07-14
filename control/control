@@ -3,5 +3,7 @@ Version: 1.9.2-1
 Architecture: all
 Maintainer: oti.cat <hello@oti.cat>
 Description: Connect SMHUB Nano MG24 to oti.cat Home Assistant instances
-Section: utils
+Section: community
 Priority: optional
+Homepage: https://github.com/oticat/connecta-m-hi
+Depends: nodejs
