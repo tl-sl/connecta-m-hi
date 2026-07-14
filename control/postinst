@@ -1,27 +1,16 @@
 #!/bin/sh
 set -e
 
-LOGFILE=/var/log/oticonnect.log
-exec >> "$LOGFILE" 2>&1
+. /usr/lib/smhub/service-helpers.sh
+
+PKG_NAME="connecta-m-hi"
+SERVICE_NAME="dom.oti.cat"
 
 echo "[oticonnect] postinst start"
 
-# The SMHUB backend now derives the app row, sidebar entry and stunnel HTTPS port from
-# schema.json (control/schema.json -> /var/lib/opkg/info/dom.oti.cat.schema.json), so postinst
-# no longer touches the backend DB, opkg lists, or stunnel config.
-
-# --- Clean up cruft from older pre-schema.json installs (no-op on a fresh install) ---
-rm -f /var/lib/opkg/lists/oticonnect-local
-rm -f /opt/smhub-services/config/stunnel.conf.d/app-oticonnect.conf
-DBFILE="/opt/smhub-services/config/backend.db"
-if [ -f "$DBFILE" ] && command -v sqlite3 > /dev/null 2>&1; then
-    sqlite3 "$DBFILE" "DELETE FROM apps WHERE key='oticonnect';" 2>/dev/null || true
-fi
-rc-update del oticonnect default 2>/dev/null || true
-
-# --- Enable + start the service (schema.json service:true declares start-at-boot) ---
-rc-update add dom.oti.cat default 2>/dev/null && echo "[oticonnect] rc-update OK" || echo "[oticonnect] rc-update (already added?)"
-rc-service dom.oti.cat start && echo "[oticonnect] service started" || echo "[oticonnect] service start failed"
+pkg_openrc_install "${PKG_NAME}" "${SERVICE_NAME}" "install"
+pkg_service_restart "${PKG_NAME}" "${SERVICE_NAME}"
 
 echo "[oticonnect] postinst done"
 exit 0
+
